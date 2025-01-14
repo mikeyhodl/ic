@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_types)]
 use aide::{
     axum::{
         routing::{get, post},
@@ -12,28 +13,36 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
-    Extension, Json, Server,
+    Extension, Json,
 };
+use axum_server::Handle;
 use clap::Parser;
+use ic_canister_sandbox_backend_lib::{
+    canister_sandbox_main, compiler_sandbox::compiler_sandbox_main,
+    launcher::sandbox_launcher_main, RUN_AS_CANISTER_SANDBOX_FLAG, RUN_AS_COMPILER_SANDBOX_FLAG,
+    RUN_AS_SANDBOX_LAUNCHER_FLAG,
+};
 use ic_crypto_iccsa::{public_key_bytes_from_der, types::SignatureBytes, verify};
 use ic_crypto_sha2::Sha256;
 use ic_crypto_utils_threshold_sig_der::parse_threshold_sig_key_from_der;
 use pocket_ic::common::rest::{BinaryBlob, BlobCompression, BlobId, RawVerifyCanisterSigArg};
-use pocket_ic_server::state_api::routes::timeout_or_default;
+use pocket_ic_server::state_api::routes::{handler_read_graph, timeout_or_default};
 use pocket_ic_server::state_api::{
-    routes::{instances_routes, status, AppState, RouterExt},
-    state::PocketIcApiStateBuilder,
+    routes::{http_gateway_routes, instances_routes, status, AppState, RouterExt},
+    state::{ApiState, PocketIcApiStateBuilder},
 };
 use pocket_ic_server::BlobStore;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
+use tokio::sync::mpsc::channel;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, Instant};
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{debug, info};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::filter::EnvFilter;
 
@@ -45,61 +54,94 @@ const LOG_DIR_PATH_ENV_NAME: &str = "POCKET_IC_LOG_DIR";
 const LOG_DIR_LEVELS_ENV_NAME: &str = "POCKET_IC_LOG_DIR_LEVELS";
 
 #[derive(Parser)]
-#[clap(version = "2.0.1")]
+#[clap(version = "7.0.0")]
 struct Args {
-    /// If you use PocketIC from the command line, you should not use this flag.
-    /// Client libraries use this flag to provide a common identifier (the process ID of the test
-    /// process) such that the server is only started once and the individual tests can (re-)use
-    /// the same server.
-    #[clap(long)]
-    pid: Option<u32>,
-    /// The port under which the PocketIC server should be started
+    /// The IP address to which the PocketIC server should bind (defaults to 127.0.0.1)
+    #[clap(long, short)]
+    ip_addr: Option<String>,
+    /// Log levels for PocketIC server logs (defaults to `pocket_ic_server=info,tower_http=info,axum::rejection=trace`).
+    #[clap(long, short)]
+    log_levels: Option<String>,
+    /// The port at which the PocketIC server should listen
     #[clap(long, short, default_value_t = 0)]
     port: u16,
+    /// The file to which the PocketIC server port should be written
+    #[clap(long)]
+    port_file: Option<PathBuf>,
     /// The time-to-live of the PocketIC server in seconds
     #[clap(long, default_value_t = TTL_SEC)]
     ttl: u64,
 }
 
+/// Get the path of the current running binary.
+fn current_binary_path() -> Option<PathBuf> {
+    std::env::args().next().map(PathBuf::from)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+extern "C" {
+    fn install_backtrace_handler();
+}
+
 fn main() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(16)
-        // we use the tokio rt to dispatch blocking operations in the background
-        .max_blocking_threads(16)
-        .build()
-        .expect("Failed to create tokio runtime!");
-    let runtime_arc = Arc::new(rt);
-    runtime_arc.block_on(async { start(runtime_arc.clone()).await });
+    let current_binary_path = current_binary_path().unwrap();
+    let current_binary_name = current_binary_path.file_name().unwrap().to_str().unwrap();
+    if current_binary_name != "pocket-ic" && current_binary_name != "pocket-ic-server" {
+        panic!("The PocketIc server binary name must be \"pocket-ic\" or \"pocket-ic-server\" (without quotes).")
+    }
+    // Check if `pocket-ic-server` is running in the canister sandbox mode where it waits
+    // for commands from the parent process. This check has to be performed
+    // before the arguments are parsed because the parent process does not pass
+    // all the normally required arguments of `pocket-ic-server`.
+    if std::env::args().any(|arg| arg == RUN_AS_CANISTER_SANDBOX_FLAG) {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        unsafe {
+            install_backtrace_handler();
+        }
+        canister_sandbox_main();
+    } else if std::env::args().any(|arg| arg == RUN_AS_SANDBOX_LAUNCHER_FLAG) {
+        sandbox_launcher_main();
+    } else if std::env::args().any(|arg| arg == RUN_AS_COMPILER_SANDBOX_FLAG) {
+        compiler_sandbox_main();
+    } else {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(16)
+            // we use the tokio rt to dispatch blocking operations in the background
+            .max_blocking_threads(16)
+            .build()
+            .expect("Failed to create tokio runtime!");
+        let runtime_arc = Arc::new(rt);
+        runtime_arc.block_on(async { start(runtime_arc.clone()).await });
+    }
 }
 
 async fn start(runtime: Arc<Runtime>) {
     let args = Args::parse();
 
-    // If PocketIC was started with the `--pid` flag, create a port file to communicate the port back to
-    // the parent process (e.g., the `cargo test` invocation). Other tests can then see this port file
-    // and reuse the same PocketIC server.
-    let use_port_file = args.pid.is_some();
-    let mut port_file_path = None;
-    let mut ready_file_path = None;
-    let mut port_file = None;
-    if use_port_file {
-        port_file_path =
-            Some(std::env::temp_dir().join(format!("pocket_ic_{}.port", args.pid.unwrap())));
-        ready_file_path =
-            Some(std::env::temp_dir().join(format!("pocket_ic_{}.ready", args.pid.unwrap())));
-        port_file = match create_file_atomically(port_file_path.clone().unwrap()) {
+    let port_file = if let Some(ref port_file_path) = args.port_file {
+        match create_file(port_file_path) {
             Ok(f) => Some(f),
             Err(_) => {
-                // A PocketIC server is already running for this PID, terminate.
+                // A PocketIC server is already running => terminate.
                 return;
             }
-        };
-    }
+        }
+    } else {
+        None
+    };
 
-    let _guard = setup_tracing(args.pid);
+    let ip_addr = args.ip_addr.unwrap_or("127.0.0.1".to_string());
+    let addr = format!("{}:{}", ip_addr, args.port);
+    let listener = std::net::TcpListener::bind(addr.clone())
+        .unwrap_or_else(|_| panic!("Failed to bind PocketIC server to address {}", addr));
+    let real_port = listener.local_addr().unwrap().port();
+
+    let _guard = setup_tracing(args.log_levels);
     // The shared, mutable state of the PocketIC process.
-    let api_state = PocketIcApiStateBuilder::default().build();
+    let api_state = PocketIcApiStateBuilder::default()
+        .with_port(real_port)
+        .build();
     // A time-to-live mechanism: Requests bump this value, and the server
     // gracefully shuts down when the value wasn't bumped for a while.
     let min_alive_until = Arc::new(RwLock::new(Instant::now()));
@@ -127,16 +169,19 @@ async fn start(runtime: Arc<Runtime>) {
         // Verify signature.
         .directory_route("/verify_signature", post(verify_signature))
         //
+        // Read state: Poll a result based on a received Started{} reply.
+        .directory_route("/read_graph/:state_label/:op_id", get(handler_read_graph))
+        //
         // All instance routes.
         .nest("/instances", instances_routes::<AppState>())
+        // All HTTP gateway routes.
+        .nest("/http_gateway", http_gateway_routes::<AppState>())
+        .fallback(|| async { (StatusCode::NOT_FOUND, "") })
         .layer(DefaultBodyLimit::disable())
         .route_layer(middleware::from_fn_with_state(
             app_state.clone(),
             bump_last_request_timestamp,
         ))
-        // For examples on how to customize the logging spans:
-        // https://github.com/tokio-rs/axum/blob/main/examples/tracing-aka-logging/src/main.rs#L45
-        .layer(TraceLayer::new_for_http())
         .with_state(app_state.clone());
 
     let mut api = OpenApi {
@@ -147,50 +192,23 @@ async fn start(runtime: Arc<Runtime>) {
         ..OpenApi::default()
     };
 
-    let server_res = Server::try_bind(
-        &format!("127.0.0.1:{}", args.port)
-            .parse()
-            .expect("Invalid server address"),
-    )
-    .map(|s| {
-        s.serve(
-            router
-                // Generate documentation
-                .finish_api(&mut api)
-                // Expose documentation
-                .layer(Extension(api))
-                .into_make_service(),
-        )
-    });
-    let server = match server_res {
-        Ok(s) => s,
-        Err(e) => {
-            error!(
-                "Failed to start the PocketIC server on port {}: {}",
-                args.port, e
-            );
-            return;
-        }
-    };
-    let real_port = server.local_addr().port();
+    let router = router
+        // Generate documentation
+        .finish_api(&mut api)
+        // Expose documentation
+        .layer(Extension(api))
+        // For examples on how to customize the logging spans:
+        // https://github.com/tokio-rs/axum/blob/main/examples/tracing-aka-logging/src/main.rs#L45
+        .layer(TraceLayer::new_for_http())
+        .into_make_service();
 
-    if use_port_file {
-        let _ = port_file
-            .as_mut()
-            .unwrap()
-            .write_all(real_port.to_string().as_bytes());
-        let _ = port_file.unwrap().flush();
-        // Signal that the port file can safely be read by other clients.
-        let ready_file = create_file_atomically(ready_file_path.clone().unwrap());
-        if ready_file.is_err() {
-            error!("The .ready file already exists; This should not happen unless the PID has been reused, and/or the tmp dir has not been properly cleaned up");
-        }
-    }
-
-    info!("The PocketIC server is listening on port {}", real_port);
-
+    let handle = Handle::new();
+    let shutdown_handle = handle.clone();
+    let axum_handle = handle.clone();
+    let port_file_path = args.port_file.clone();
+    let app_state_clone = app_state.clone();
     // This is a safeguard against orphaning this child process.
-    let shutdown_signal = async {
+    tokio::spawn(async move {
         loop {
             let guard = app_state.min_alive_until.read().await;
             if guard.elapsed() > Duration::from_secs(args.ttl) {
@@ -199,15 +217,61 @@ async fn start(runtime: Arc<Runtime>) {
             drop(guard);
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        info!("The PocketIC server will terminate");
-        if use_port_file {
-            // Clean up port files.
-            let _ = std::fs::remove_file(ready_file_path.unwrap());
-            let _ = std::fs::remove_file(port_file_path.unwrap());
+
+        terminate(app_state, shutdown_handle, port_file_path).await;
+    });
+    // Register a signal handler.
+    let (tx, mut rx) = channel(1);
+    let shutdown_handle = handle.clone();
+    let port_file_path = args.port_file.clone();
+    tokio::spawn(async move {
+        if let Some(()) = rx.recv().await {
+            terminate(app_state_clone, shutdown_handle, port_file_path).await;
         }
-    };
-    let server = server.with_graceful_shutdown(shutdown_signal);
-    server.await.expect("Failed to launch the PocketIC server");
+    });
+    ctrlc::set_handler(move || {
+        tx.blocking_send(())
+            .expect("Could not send signal on channel.")
+    })
+    .expect("Error setting Ctrl-C handler");
+
+    let main_task = tokio::spawn(async move {
+        axum_server::from_tcp(listener)
+            .handle(axum_handle)
+            .serve(router)
+            .await
+            .unwrap();
+    });
+
+    // Wait until the PocketIC server starts listening.
+    while handle.listening().await.is_none() {}
+
+    if let Some(mut port_file) = port_file {
+        let _ = port_file.write_all(format!("{}\n", real_port).as_bytes());
+        let _ = port_file.flush();
+    }
+
+    info!("The PocketIC server is listening on port {}", real_port);
+
+    main_task.await.unwrap();
+}
+
+async fn terminate(
+    app_state: AppState,
+    shutdown_handle: axum_server::Handle,
+    port_file_path: Option<PathBuf>,
+) {
+    debug!("The PocketIC server will terminate");
+
+    app_state.api_state.stop_all_http_gateways().await;
+    ApiState::delete_all_instances(app_state.api_state).await;
+
+    if let Some(port_file_path) = port_file_path {
+        // Clean up port file.
+        let _ = std::fs::remove_file(port_file_path);
+    }
+
+    shutdown_handle.shutdown();
 }
 
 async fn serve_api(Extension(api): Extension<OpenApi>) -> impl IntoApiResponse {
@@ -215,7 +279,7 @@ async fn serve_api(Extension(api): Extension<OpenApi>) -> impl IntoApiResponse {
 }
 
 // Registers a global subscriber that collects tracing events and spans.
-fn setup_tracing(pid: Option<u32>) -> Option<WorkerGuard> {
+fn setup_tracing(log_levels: Option<String>) -> Option<WorkerGuard> {
     use time::format_description::well_known::Rfc3339;
     use time::OffsetDateTime;
     use tracing_subscriber::prelude::*;
@@ -223,8 +287,12 @@ fn setup_tracing(pid: Option<u32>) -> Option<WorkerGuard> {
     let mut layers = Vec::new();
 
     let default_log_filter = || {
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| DEFAULT_LOG_LEVELS.to_string().into())
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            log_levels
+                .clone()
+                .unwrap_or(DEFAULT_LOG_LEVELS.to_string())
+                .into()
+        })
     };
 
     layers.push(
@@ -237,11 +305,7 @@ fn setup_tracing(pid: Option<u32>) -> Option<WorkerGuard> {
         Ok(p) => {
             std::fs::create_dir_all(&p).expect("Could not create directory");
             let dt = OffsetDateTime::from(std::time::SystemTime::now());
-            let ts = dt.format(&Rfc3339).unwrap().replace(':', "_");
-            let logfile_suffix = match pid {
-                Some(pid) => format!("{}_{}", ts, pid),
-                None => format!("{}_cli", ts),
-            };
+            let logfile_suffix = dt.format(&Rfc3339).unwrap().replace(':', "_");
             let appender = tracing_appender::rolling::never(
                 &p,
                 format!("pocket_ic_server_{logfile_suffix}.log"),
@@ -269,8 +333,8 @@ fn setup_tracing(pid: Option<u32>) -> Option<WorkerGuard> {
     guard
 }
 
-// Ensures atomically that this file was created freshly, and gives an error otherwise.
-fn create_file_atomically<P: AsRef<std::path::Path>>(file_path: P) -> std::io::Result<File> {
+// Create a file at a given path ensuring atomically that the file was created freshly and giving an error otherwise.
+fn create_file<P: AsRef<std::path::Path>>(file_path: P) -> std::io::Result<File> {
     File::options()
         .read(true)
         .write(true)
@@ -278,13 +342,13 @@ fn create_file_atomically<P: AsRef<std::path::Path>>(file_path: P) -> std::io::R
         .open(&file_path)
 }
 
-async fn bump_last_request_timestamp<B>(
+async fn bump_last_request_timestamp(
     State(AppState {
         min_alive_until, ..
     }): State<AppState>,
     headers: HeaderMap,
-    request: http::Request<B>,
-    next: Next<B>,
+    request: http::Request<axum::body::Body>,
+    next: Next,
 ) -> impl IntoApiResponse {
     // TTL should not decrease: If now + header_timeout is later
     // than the current TTL (from previous requests), reset it.
@@ -296,6 +360,7 @@ async fn bump_last_request_timestamp<B>(
     if *min_alive_until < alive_until {
         *min_alive_until = alive_until;
     }
+    drop(min_alive_until);
     next.run(request).await
 }
 

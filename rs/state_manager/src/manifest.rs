@@ -10,27 +10,26 @@ mod tests {
 use super::CheckpointError;
 use crate::{
     manifest::hash::{meta_manifest_hasher, sub_manifest_hasher},
+    state_sync::types::{
+        encode_manifest, ChunkInfo, FileGroupChunks, FileInfo, Manifest, MetaManifest,
+        DEFAULT_CHUNK_SIZE, FILE_CHUNK_ID_OFFSET, FILE_GROUP_CHUNK_ID_OFFSET,
+        MAX_SUPPORTED_STATE_SYNC_VERSION,
+    },
     BundledManifest, DirtyPages, ManifestMetrics, CRITICAL_ERROR_CHUNK_ID_USAGE_NEARING_LIMITS,
     CRITICAL_ERROR_REUSED_CHUNK_HASH, LABEL_VALUE_HASHED, LABEL_VALUE_HASHED_AND_COMPARED,
     LABEL_VALUE_REUSED, NUMBER_OF_CHECKPOINT_THREADS,
 };
 use bit_vec::BitVec;
 use hash::{chunk_hasher, file_hasher, manifest_hasher, ManifestHash};
+use ic_config::flag_status::FlagStatus;
 use ic_crypto_sha2::Sha256;
 use ic_logger::{error, fatal, replica_logger::no_op_logger, ReplicaLogger};
 use ic_metrics::MetricsRegistry;
+use ic_replicated_state::page_map::StorageLayout;
 use ic_replicated_state::PageIndex;
-use ic_state_layout::{CheckpointLayout, ReadOnly, CANISTER_FILE};
+use ic_state_layout::{CheckpointLayout, ReadOnly, CANISTER_FILE, UNVERIFIED_CHECKPOINT_MARKER};
 use ic_sys::{mmap::ScopedMmap, PAGE_SIZE};
-use ic_types::{
-    crypto::CryptoHash,
-    state_sync::{
-        encode_manifest, ChunkInfo, FileGroupChunks, FileInfo, Manifest, MetaManifest,
-        StateSyncVersion, FILE_CHUNK_ID_OFFSET, FILE_GROUP_CHUNK_ID_OFFSET,
-        MAX_SUPPORTED_STATE_SYNC_VERSION,
-    },
-    CryptoHashOfState, Height,
-};
+use ic_types::{crypto::CryptoHash, state_sync::StateSyncVersion, CryptoHashOfState, Height};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaChaRng;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -38,8 +37,6 @@ use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
-
-pub use ic_types::state_sync::DEFAULT_CHUNK_SIZE;
 
 /// When computing a manifest, we recompute the hash of every
 /// `REHASH_EVERY_NTH_CHUNK` chunk, even if we know it to be unchanged and
@@ -63,7 +60,7 @@ const FILE_TO_GROUP: &str = CANISTER_FILE;
 ///     will decrease by at least two orders of magnitude, which is significant enough.
 const MAX_FILE_SIZE_TO_GROUP: u32 = 1 << 13; // 8 KiB
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Eq, PartialEq, Debug)]
 pub enum ManifestValidationError {
     InvalidRootHash {
         expected_hash: Vec<u8>,
@@ -121,7 +118,7 @@ impl fmt::Display for ManifestValidationError {
 
 impl std::error::Error for ManifestValidationError {}
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Eq, PartialEq, Debug)]
 pub enum ChunkValidationError {
     InvalidChunkHash {
         chunk_ix: usize,
@@ -177,10 +174,10 @@ impl fmt::Display for ChunkValidationError {
 impl std::error::Error for ChunkValidationError {}
 
 /// Relative path to a file and the size of the file.
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 struct FileWithSize(PathBuf, u64);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, Eq, PartialEq, Debug)]
 enum ChunkAction {
     /// Recompute the hash of the chunk, as no previously computed hash is
     /// available
@@ -198,7 +195,7 @@ pub type NewIndex = usize;
 pub type OldIndex = usize;
 
 /// A script describing how to turn an old state into a new state.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Eq, PartialEq, Debug)]
 pub struct DiffScript {
     /// Copy some files from the old state.
     /// Keys are indices of the file table in the new manifest file,
@@ -235,6 +232,7 @@ pub struct ManifestDelta {
     /// state at `base_height`.
     pub(crate) dirty_memory_pages: DirtyPages,
     pub(crate) base_checkpoint: CheckpointLayout<ReadOnly>,
+    pub(crate) lsmt_status: FlagStatus,
 }
 
 /// Groups small files into larger chunks.
@@ -570,9 +568,6 @@ fn files_with_sizes(
     if metadata.is_file() {
         files.push(FileWithSize(relative_path, metadata.len()))
     } else {
-        if relative_path.ends_with("slot_db") {
-            return Ok(());
-        }
         assert!(
             metadata.is_dir(),
             "Checkpoints must not contain special files, found one at {}",
@@ -790,26 +785,40 @@ fn dirty_pages_to_dirty_chunks(
     );
 
     let mut dirty_chunks: BTreeMap<PathBuf, BitVec> = Default::default();
-    for dirty_page in &manifest_delta.dirty_memory_pages {
-        if dirty_page.height != manifest_delta.base_height {
-            continue;
-        }
 
-        let path = dirty_page.page_type.path(checkpoint);
+    // If `lsmt_status` is enabled, we shouldn't have populated `dirty_memory_pages` in the first place.
+    debug_assert!(
+        manifest_delta.lsmt_status == FlagStatus::Disabled
+            || manifest_delta.dirty_memory_pages.is_empty()
+    );
 
-        if let Ok(path) = path {
-            let relative_path = path
-                .strip_prefix(checkpoint.raw_path())
-                .expect("failed to strip path prefix");
+    // Any information on dirty pages is not relevant to what files might have changed with
+    // `lsmt_status` enabled.
+    if manifest_delta.lsmt_status == FlagStatus::Disabled {
+        for dirty_page in &manifest_delta.dirty_memory_pages {
+            if dirty_page.height != manifest_delta.base_height {
+                continue;
+            }
 
-            if let Some(chunks_bitmap) = dirty_chunks_of_file(
-                relative_path,
-                &dirty_page.page_delta_indices,
-                files,
-                max_chunk_size,
-                &manifest_delta.base_manifest,
-            ) {
-                dirty_chunks.insert(relative_path.to_path_buf(), chunks_bitmap);
+            let path = dirty_page
+                .page_type
+                .layout(checkpoint)
+                .map(|layout| layout.base());
+
+            if let Ok(path) = path {
+                let relative_path = path
+                    .strip_prefix(checkpoint.raw_path())
+                    .expect("failed to strip path prefix");
+
+                if let Some(chunks_bitmap) = dirty_chunks_of_file(
+                    relative_path,
+                    &dirty_page.page_delta_indices,
+                    files,
+                    max_chunk_size,
+                    &manifest_delta.base_manifest,
+                ) {
+                    dirty_chunks.insert(relative_path.to_path_buf(), chunks_bitmap);
+                }
             }
         }
     }
@@ -825,7 +834,7 @@ fn dirty_pages_to_dirty_chunks(
         let new_path = checkpoint.raw_path().join(path);
         let old_path = manifest_delta.base_checkpoint.raw_path().join(path);
         if !old_path.exists() {
-            break;
+            continue;
         }
         let new_metadata = new_path.metadata();
         let old_metadata = old_path.metadata();
@@ -847,6 +856,7 @@ fn dirty_pages_to_dirty_chunks(
             let num_chunks = count_chunks(*size_bytes, max_chunk_size);
             let chunks_bitmap = BitVec::from_elem(num_chunks, false);
             let _prev_chunk = dirty_chunks.insert(path.clone(), chunks_bitmap);
+            // Check that for hardlinked files there are no dirty pages.
             debug_assert!(_prev_chunk.is_none());
         }
     }
@@ -863,13 +873,27 @@ pub fn compute_manifest(
     max_chunk_size: u32,
     opt_manifest_delta: Option<ManifestDelta>,
 ) -> Result<Manifest, CheckpointError> {
-    let files = {
+    let mut files = {
         let mut files = Vec::new();
         files_with_sizes(checkpoint.raw_path(), "".into(), &mut files)?;
         // We sort the table to make sure that the table is the same on all replicas
         files.sort_unstable_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
         files
     };
+
+    // Currently, the unverified checkpoint marker file should already be removed by the time we reach this point.
+    // If it accidentally exists, the replica will crash in the outer function `handle_compute_manifest_request`.
+    //
+    // Because this function may still be used by tests and external tools to compute manifest of an unverified checkpoint,
+    // the function does not crash here. Instead, we exclude the marker file from the manifest computation.
+    if !checkpoint.is_checkpoint_verified() {
+        files.retain(|FileWithSize(p, _)| {
+            checkpoint.raw_path().join(p) != checkpoint.unverified_checkpoint_marker()
+        });
+        assert!(!files
+            .iter()
+            .any(|FileWithSize(p, _)| p.ends_with(UNVERIFIED_CHECKPOINT_MARKER)));
+    }
 
     let chunk_actions = match opt_manifest_delta {
         Some(manifest_delta) => {
@@ -941,6 +965,10 @@ pub fn compute_manifest(
     metrics
         .chunk_table_length
         .set(manifest.chunk_table.len() as i64);
+
+    metrics
+        .file_table_length
+        .set(manifest.file_table.len() as i64);
 
     let file_chunk_id_range_length = FILE_GROUP_CHUNK_ID_OFFSET as usize - FILE_CHUNK_ID_OFFSET;
     if manifest.chunk_table.len() > file_chunk_id_range_length / 2 {
@@ -1246,8 +1274,7 @@ pub(crate) fn compute_bundled_manifest(manifest: Manifest) -> BundledManifest {
     }
 }
 
-// This method will be used when replicas start fetching meta-manifest in future versions.
-#[allow(dead_code)]
+/// Checks that the hash of the meta-manifest matches the expected root hash.
 pub fn validate_meta_manifest(
     meta_manifest: &MetaManifest,
     root_hash: &CryptoHashOfState,

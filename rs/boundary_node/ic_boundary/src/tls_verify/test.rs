@@ -1,13 +1,18 @@
 use super::*;
 
-use std::time::{Duration, SystemTime};
+use std::{str::FromStr, time::Duration};
 
 use anyhow::Error;
+use ic_types::{NodeId, PrincipalId};
+use rustls::{
+    pki_types::{CertificateDer, ServerName, UnixTime},
+    CertificateError, Error as RustlsError,
+};
 
-use ic_crypto_test_utils_keys::public_keys::valid_tls_certificate_and_validation_time;
-use rustls::{Certificate, CertificateError, Error as RustlsError, ServerName};
-
-use crate::snapshot::{test::create_fake_registry_client_single_node, Snapshot, Snapshotter};
+use crate::{
+    snapshot::{Snapshot, Snapshotter},
+    test_utils::{create_fake_registry_client, valid_tls_certificate_and_validation_time},
+};
 
 // CN = s52il-lowsg-eip4y-pt5lv-sbdpb-vg4gg-4iasu-egajp-yluji-znfz3-2qe
 const TEST_CERTIFICATE: &str = "3082015530820107a00302010202136abf05c1260364e09ad5f4ad0e9cb90a6e0edb300506032b6570304a3148304606035504030c3f733532696c2d6c6f7773672d\
@@ -26,19 +31,17 @@ fn check_certificate_verification(
     name: &str,
     der: Vec<u8>,
 ) -> Result<(), RustlsError> {
-    let crt = Certificate(der);
-    let intermediates: Vec<Certificate> = vec![];
+    let crt = CertificateDer::from(der);
+    let intermediates: Vec<CertificateDer> = vec![];
     let server_name = ServerName::try_from(name).unwrap();
-    let scts: Vec<&[u8]> = vec![];
     let ocsp_response: Vec<u8> = vec![];
 
     tls_verifier.verify_server_cert(
         &crt,
         intermediates.as_slice(),
         &server_name,
-        &mut scts.into_iter(),
         ocsp_response.as_slice(),
-        SystemTime::now(),
+        UnixTime::now(),
     )?;
 
     Ok(())
@@ -47,10 +50,20 @@ fn check_certificate_verification(
 #[tokio::test]
 async fn test_verify_tls_certificate() -> Result<(), Error> {
     let snapshot = Arc::new(ArcSwapOption::empty());
-    let reg = Arc::new(create_fake_registry_client_single_node());
-    let mut snapshotter = Snapshotter::new(Arc::clone(&snapshot), reg, Duration::ZERO);
-    let verifier = TlsVerifier::new(Arc::clone(&snapshot));
-    snapshotter.snapshot().await?;
+
+    // Same node_id that valid_tls_certificate_and_validation_time() is valid for
+    let node_id = NodeId::from(
+        PrincipalId::from_str("4inqb-2zcvk-f6yql-sowol-vg3es-z24jd-jrkow-mhnsd-ukvfp-fak5p-aae")
+            .unwrap(),
+    );
+
+    let (reg, _, _) = create_fake_registry_client(1, 1, Some(node_id));
+    let reg = Arc::new(reg);
+    let (channel_send, _) = tokio::sync::watch::channel(None);
+    let mut snapshotter =
+        Snapshotter::new(Arc::clone(&snapshot), channel_send, reg, Duration::ZERO);
+    let verifier = TlsVerifier::new(Arc::clone(&snapshot), false);
+    snapshotter.snapshot()?;
 
     let snapshot = snapshot.load_full().unwrap();
     let node_name = snapshot.subnets[0].nodes[0].id.to_string();

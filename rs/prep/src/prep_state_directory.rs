@@ -128,7 +128,8 @@ mod tests {
                 public_api: SocketAddr::from_str("1.2.3.4:8081").unwrap(),
                 node_operator_principal_id: None,
                 secret_key_store: None,
-                chip_id: None,
+                domain: None,
+                node_reward_type: None,
             },
         );
 
@@ -156,6 +157,7 @@ mod tests {
                 vec![],
                 vec![],
                 SubnetRunningState::Active,
+                None,
             ),
         );
 
@@ -171,7 +173,6 @@ mod tests {
             None,
             None,
             /* ssh_readonly_access_to_unassigned_nodes */ vec![],
-            /* guest_launch_measurement_sha256_hex */ None,
         );
         let _init_ic = ic_config.initialize()?;
 

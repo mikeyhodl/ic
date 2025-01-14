@@ -1,5 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
-load("//bazel:defs.bzl", "rust_bench")
+load("//bazel:defs.bzl", "rust_bench", "rust_ic_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -11,8 +11,13 @@ rust_library(
         "//conditions:default": [],
     }),
     crate_name = "ic_state_manager",
+    proc_macro_deps = [
+        # Keep sorted.
+        "@crate_index//:strum_macros",
+    ],
     version = "0.9.0",
     deps = [
+        # Keep sorted.
         "//rs/canonical_state",
         "//rs/canonical_state/tree_hash",
         "//rs/config",
@@ -34,6 +39,8 @@ rust_library(
         "//rs/types/error_types",
         "//rs/types/types",
         "//rs/utils",
+        "//rs/utils/thread",
+        "//rs/utils/validate_eq",
         "@crate_index//:bit-vec",
         "@crate_index//:crossbeam-channel",
         "@crate_index//:hex",
@@ -47,6 +54,7 @@ rust_library(
         "@crate_index//:serde",
         "@crate_index//:serde_bytes",
         "@crate_index//:slog",
+        "@crate_index//:strum",
         "@crate_index//:tempfile",
         "@crate_index//:uuid",
     ],
@@ -57,14 +65,18 @@ rust_test(
     timeout = "long",
     crate = ":state_manager",
     deps = [
+        # Keep sorted.
         "//rs/registry/routing_table",
         "//rs/registry/subnet_features",
         "//rs/registry/subnet_type",
-        "//rs/test_utilities",
+        "//rs/test_utilities/consensus",
         "//rs/test_utilities/logger",
+        "//rs/test_utilities/state",
+        "//rs/test_utilities/time",
         "//rs/test_utilities/tmpdir",
+        "//rs/test_utilities/types",
         "//rs/types/error_types",
-        "//rs/types/ic00_types",
+        "//rs/types/management_canister_types",
         "//rs/types/wasm_types",
         "@crate_index//:assert_matches",
         "@crate_index//:maplit",
@@ -74,7 +86,7 @@ rust_test(
     ],
 )
 
-rust_test(
+rust_ic_test(
     name = "state_manager_integration_test",
     timeout = "long",
     srcs = [
@@ -83,6 +95,7 @@ rust_test(
     ],
     crate_root = "tests/state_manager.rs",
     deps = [
+        # Keep sorted.
         ":state_manager",
         "//rs/canonical_state/certification_version",
         "//rs/config",
@@ -98,12 +111,16 @@ rust_test(
         "//rs/state_layout",
         "//rs/state_machine_tests",
         "//rs/sys",
-        "//rs/test_utilities",
+        "//rs/test_utilities/consensus",
+        "//rs/test_utilities/io",
         "//rs/test_utilities/logger",
         "//rs/test_utilities/metrics",
+        "//rs/test_utilities/state",
+        "//rs/test_utilities/time",
         "//rs/test_utilities/tmpdir",
+        "//rs/test_utilities/types",
         "//rs/types/base_types",
-        "//rs/types/ic00_types",
+        "//rs/types/management_canister_types",
         "//rs/types/types",
         "//rs/types/wasm_types",
         "@crate_index//:assert_matches",
@@ -120,6 +137,7 @@ rust_bench(
     name = "traversal_bench",
     srcs = ["benches/bench_traversal.rs"],
     deps = [
+        # Keep sorted.
         ":state_manager",
         "//rs/canonical_state",
         "//rs/canonical_state/certification_version",
@@ -129,7 +147,9 @@ rust_bench(
         "//rs/crypto/tree_hash",
         "//rs/registry/subnet_type",
         "//rs/replicated_state",
-        "//rs/test_utilities",
+        "//rs/test_utilities/state",
+        "//rs/test_utilities/time",
+        "//rs/test_utilities/types",
         "//rs/types/base_types",
         "//rs/types/error_types",
         "//rs/types/types",

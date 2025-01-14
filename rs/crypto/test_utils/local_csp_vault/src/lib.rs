@@ -23,12 +23,17 @@ use ic_crypto_internal_csp::vault::api::PublicRandomSeedGenerator;
 use ic_crypto_internal_csp::vault::api::PublicRandomSeedGeneratorError;
 use ic_crypto_internal_csp::vault::api::SecretKeyStoreCspVault;
 use ic_crypto_internal_csp::vault::api::ThresholdEcdsaSignerCspVault;
+use ic_crypto_internal_csp::vault::api::ThresholdSchnorrCreateSigShareVaultError;
+use ic_crypto_internal_csp::vault::api::ThresholdSchnorrSigShareBytes;
+use ic_crypto_internal_csp::vault::api::ThresholdSchnorrSignerCspVault;
 use ic_crypto_internal_csp::vault::api::ThresholdSignatureCspVault;
 use ic_crypto_internal_csp::vault::api::TlsHandshakeCspVault;
 use ic_crypto_internal_csp::vault::api::ValidatePksAndSksError;
+use ic_crypto_internal_csp::vault::api::VetKdCspVault;
+use ic_crypto_internal_csp::vault::api::VetKdEncryptedKeyShareCreationVaultError;
 use ic_crypto_internal_seed::Seed;
 use ic_crypto_internal_threshold_sig_bls12381::api::ni_dkg_errors;
-use ic_crypto_internal_threshold_sig_ecdsa::{
+use ic_crypto_internal_threshold_sig_canister_threshold_sig::{
     CommitmentOpening, IDkgComplaintInternal, MEGaPublicKey, ThresholdEcdsaSigShareInternal,
 };
 use ic_crypto_internal_types::encrypt::forward_secure::{
@@ -42,12 +47,13 @@ use ic_crypto_tls_interfaces::TlsPublicKeyCert;
 use ic_protobuf::registry::crypto::v1::PublicKey;
 use ic_types::crypto::canister_threshold_sig::error::{
     IDkgLoadTranscriptError, IDkgOpenTranscriptError, IDkgRetainKeysError,
-    IDkgVerifyDealingPrivateError, ThresholdEcdsaSignShareError,
+    IDkgVerifyDealingPrivateError, ThresholdEcdsaCreateSigShareError,
 };
-use ic_types::crypto::canister_threshold_sig::{
-    idkg::{BatchSignedIDkgDealing, IDkgTranscriptOperation},
-    ExtendedDerivationPath,
+use ic_types::crypto::canister_threshold_sig::idkg::{
+    BatchSignedIDkgDealing, IDkgTranscriptOperation,
 };
+use ic_types::crypto::vetkd::VetKdEncryptedKeyShareContent;
+use ic_types::crypto::ExtendedDerivationPath;
 use ic_types::crypto::{AlgorithmId, CurrentNodePublicKeys};
 use ic_types::{NodeId, NodeIndex, NumberOfNodes, Randomness};
 use mockall::mock;
@@ -150,6 +156,7 @@ mock! {
 
         fn idkg_load_transcript(
             &self,
+            algorithm_id: AlgorithmId,
             dealings: BTreeMap<NodeIndex, BatchSignedIDkgDealing>,
             context_data: Vec<u8>,
             receiver_index: NodeIndex,
@@ -159,6 +166,7 @@ mock! {
 
         fn idkg_load_transcript_with_openings(
             &self,
+            algorithm_id: AlgorithmId,
             dealings: BTreeMap<NodeIndex, BatchSignedIDkgDealing>,
             openings: BTreeMap<NodeIndex, BTreeMap<NodeIndex, CommitmentOpening>>,
             context_data: Vec<u8>,
@@ -171,6 +179,7 @@ mock! {
 
         fn idkg_open_dealing(
             &self,
+            algorithm_id: AlgorithmId,
             dealing: BatchSignedIDkgDealing,
             dealer_index: NodeIndex,
             context_data: Vec<u8>,
@@ -186,7 +195,7 @@ mock! {
     }
 
     impl ThresholdEcdsaSignerCspVault for LocalCspVault {
-        fn ecdsa_sign_share(
+        fn create_ecdsa_sig_share(
             &self,
             derivation_path: ExtendedDerivationPath,
             hashed_message: Vec<u8>,
@@ -197,7 +206,31 @@ mock! {
             kappa_times_lambda_raw: IDkgTranscriptInternalBytes,
             key_times_lambda_raw: IDkgTranscriptInternalBytes,
             algorithm_id: AlgorithmId,
-        ) -> Result<ThresholdEcdsaSigShareInternal, ThresholdEcdsaSignShareError>;
+        ) -> Result<ThresholdEcdsaSigShareInternal, ThresholdEcdsaCreateSigShareError>;
+    }
+
+    impl ThresholdSchnorrSignerCspVault for LocalCspVault {
+        fn create_schnorr_sig_share(
+            &self,
+            derivation_path: ExtendedDerivationPath,
+            message: Vec<u8>,
+            taproot_tree_root: Option<Vec<u8>>,
+            nonce: Randomness,
+            key_raw: IDkgTranscriptInternalBytes,
+            presig_raw: IDkgTranscriptInternalBytes,
+            algorithm_id: AlgorithmId,
+        ) -> Result<ThresholdSchnorrSigShareBytes, ThresholdSchnorrCreateSigShareVaultError>;
+    }
+
+    impl VetKdCspVault for LocalCspVault {
+        fn create_encrypted_vetkd_key_share(
+            &self,
+            key_id: KeyId,
+            master_public_key: Vec<u8>,
+            encryption_public_key: Vec<u8>,
+            derivation_path: ExtendedDerivationPath,
+            derivation_id: Vec<u8>,
+        ) -> Result<VetKdEncryptedKeyShareContent, VetKdEncryptedKeyShareCreationVaultError>;
     }
 
     impl SecretKeyStoreCspVault for LocalCspVault{

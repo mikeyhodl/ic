@@ -1,63 +1,103 @@
 //! The execution environment public interface.
 mod errors;
 
-pub use errors::{CanisterOutOfCyclesError, HypervisorError, TrapCode};
+pub use errors::{CanisterBacktrace, CanisterOutOfCyclesError, HypervisorError, TrapCode};
 use ic_base_types::NumBytes;
 use ic_error_types::UserError;
-use ic_ic00_types::EcdsaKeyId;
-use ic_interfaces_state_manager::Labeled;
+use ic_management_canister_types::MasterPublicKeyId;
 use ic_registry_provisional_whitelist::ProvisionalWhitelist;
 use ic_registry_subnet_type::SubnetType;
 use ic_sys::{PageBytes, PageIndex};
 use ic_types::{
-    crypto::canister_threshold_sig::MasterEcdsaPublicKey,
+    consensus::idkg::PreSigId,
+    crypto::canister_threshold_sig::MasterPublicKey,
     ingress::{IngressStatus, WasmResult},
-    messages::{
-        AnonymousQuery, AnonymousQueryResponse, CertificateDelegation, HttpQueryResponse,
-        MessageId, SignedIngressContent, UserQuery,
-    },
-    Cycles, ExecutionRound, Height, NumInstructions, NumPages, Randomness, Time,
+    messages::{CertificateDelegation, MessageId, Query, SignedIngressContent},
+    CanisterLog, Cycles, ExecutionRound, Height, NumInstructions, NumOsPages, Randomness,
+    ReplicaVersion, Time,
 };
 use serde::{Deserialize, Serialize};
-use std::convert::TryFrom;
-use std::sync::Arc;
-use std::{collections::BTreeMap, ops};
-use std::{convert::Infallible, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    convert::{Infallible, TryFrom},
+    fmt, ops,
+    sync::Arc,
+};
+use strum_macros::EnumIter;
+use thiserror::Error;
 use tower::util::BoxCloneService;
 
 /// Instance execution statistics. The stats are cumulative and
 /// contain measurements from the point in time when the instance was
 /// created up until the moment they are requested.
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Clone, PartialEq, Debug, Default, Deserialize, Serialize)]
 pub struct InstanceStats {
-    /// Total number of (host) pages accessed (read or written) by the instance
+    /// Total number of (host) OS pages (4KiB) accessed (read or written) by the instance
     /// and loaded into the linear memory.
-    pub accessed_pages: usize,
+    pub wasm_accessed_pages: usize,
 
-    /// Total number of (host) pages modified by the instance.
+    /// Total number of (host) OS pages (4KiB) modified by the instance.
     /// By definition a page that has been dirtied has also been accessed,
     /// hence this dirtied_pages <= accessed_pages
-    pub dirty_pages: usize,
+    pub wasm_dirty_pages: usize,
 
     /// Number of times a write access is handled when the page has already been
     /// read.
-    pub read_before_write_count: usize,
+    pub wasm_read_before_write_count: usize,
 
     /// Number of times a write access is handled when the page has not yet been
     /// read.
-    pub direct_write_count: usize,
+    pub wasm_direct_write_count: usize,
 
     /// Number of sigsegv handled.
-    pub sigsegv_count: usize,
+    pub wasm_sigsegv_count: usize,
 
     /// Number of calls to mmap.
-    pub mmap_count: usize,
+    pub wasm_mmap_count: usize,
 
     /// Number of calls to mprotect.
-    pub mprotect_count: usize,
+    pub wasm_mprotect_count: usize,
 
     /// Number of pages loaded by copying the data.
-    pub copy_page_count: usize,
+    pub wasm_copy_page_count: usize,
+
+    /// Number of accessed OS pages (4KiB) in stable memory.
+    pub stable_accessed_pages: usize,
+
+    /// Number of modified OS pages (4KiB) in stable memory.
+    pub stable_dirty_pages: usize,
+
+    /// Number of times a write access is handled when the page has already been
+    /// read.
+    pub stable_read_before_write_count: usize,
+
+    /// Number of times a write access is handled when the page has not yet been
+    /// read.
+    pub stable_direct_write_count: usize,
+
+    /// Number of sigsegv handled.
+    pub stable_sigsegv_count: usize,
+
+    /// Number of calls to mmap for stable memory.
+    pub stable_mmap_count: usize,
+
+    /// Number of calls to mprotect for stable memory.
+    pub stable_mprotect_count: usize,
+
+    /// Number of pages loaded by copying the data in stable memory.
+    pub stable_copy_page_count: usize,
+}
+
+impl InstanceStats {
+    // Returns the sum of dirty pages over the wasm heap and stable memory.
+    // Will be used when computing the heap delta at the end of the message.
+    pub fn dirty_pages(&self) -> usize {
+        self.wasm_dirty_pages + self.stable_dirty_pages
+    }
+    // Returns the sum of accessed pages over the wasm heap and stable memory.
+    pub fn accessed_pages(&self) -> usize {
+        self.wasm_accessed_pages + self.stable_accessed_pages
+    }
 }
 
 /// Errors that can be returned when fetching the available memory on a subnet.
@@ -85,7 +125,7 @@ pub enum PerformanceCounterType {
 }
 
 /// System API call ids to track their execution (in alphabetical order).
-#[derive(Debug)]
+#[derive(Eq, PartialEq, Ord, PartialOrd, Debug, EnumIter)]
 pub enum SystemApiCallId {
     /// Tracker for `ic0.accept_message())`
     AcceptMessage,
@@ -101,6 +141,8 @@ pub enum SystemApiCallId {
     CallOnCleanup,
     /// Tracker for `ic0.call_perform()`
     CallPerform,
+    /// Tracker for `ic0.call_with_best_effort_response()`
+    CallWithBestEffortResponse,
     /// Tracker for `ic0.canister_cycle_balance()`
     CanisterCycleBalance,
     /// Tracker for `ic0.canister_cycle_balance128()`
@@ -127,10 +169,14 @@ pub enum SystemApiCallId {
     DebugPrint,
     /// Tracker for `ic0.global_timer_set()`
     GlobalTimerSet,
+    /// Tracker for `ic0.in_replicated_execution()`
+    InReplicatedExecution,
     /// Tracker for `ic0.is_controller()`
     IsController,
     /// Tracker for `ic0.mint_cycles()`
     MintCycles,
+    /// Tracker for `ic0.mint_cycles128()`
+    MintCycles128,
     /// Tracker for `ic0.msg_arg_data_copy()`
     MsgArgDataCopy,
     /// Tracker for `ic0.msg_arg_data_size()`
@@ -151,6 +197,8 @@ pub enum SystemApiCallId {
     MsgCyclesRefunded,
     /// Tracker for `ic0.msg_cycles_refunded128()`
     MsgCyclesRefunded128,
+    /// Tracker for `ic0.msg_deadline()`
+    MsgDeadline,
     /// Tracker for `ic0.msg_method_name_copy()`
     MsgMethodNameCopy,
     /// Tracker for `ic0.msg_method_name_size()`
@@ -191,17 +239,16 @@ pub enum SystemApiCallId {
     Time,
     /// Tracker for `ic0.trap()`
     Trap,
-    /// Tracker for `__.update_available_memory()`
-    UpdateAvailableMemory,
+    /// Tracker for `__.try_grow_wasm_memory()`
+    TryGrowWasmMemory,
 }
 
 /// System API call counters, i.e. how many times each tracked System API call
 /// was invoked.
-// #[derive(Serialize, Deserialize, Clone, Debug, Default)]
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Debug, Default, Deserialize, Serialize)]
 pub struct SystemApiCallCounters {
-    /// Counter for `ic0.call_perform()`
-    pub call_perform: usize,
+    /// Counter for `ic0.data_certificate_copy()`
+    pub data_certificate_copy: usize,
     /// Counter for `ic0.canister_cycle_balance()`
     pub canister_cycle_balance: usize,
     /// Counter for `ic0.canister_cycle_balance128()`
@@ -212,7 +259,9 @@ pub struct SystemApiCallCounters {
 
 impl SystemApiCallCounters {
     pub fn saturating_add(&mut self, rhs: Self) {
-        self.call_perform = self.call_perform.saturating_add(rhs.call_perform);
+        self.data_certificate_copy = self
+            .data_certificate_copy
+            .saturating_add(rhs.data_certificate_copy);
         self.canister_cycle_balance = self
             .canister_cycle_balance
             .saturating_add(rhs.canister_cycle_balance);
@@ -232,7 +281,7 @@ impl SystemApiCallCounters {
 /// Note that there are situations where execution available memory is smaller than
 /// the wasm custom sections memory, i.e. when the memory is consumed by something
 /// other than wasm custom sections.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Debug, Default, Deserialize, Serialize)]
 pub struct SubnetAvailableMemory {
     /// The execution memory available on the subnet, i.e. the canister memory
     /// (Wasm binary, Wasm memory, stable memory) without message memory.
@@ -401,17 +450,13 @@ impl ops::Div<i64> for SubnetAvailableMemory {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Debug, Deserialize, Serialize)]
 pub enum ExecutionMode {
     Replicated,
     NonReplicated,
 }
 
 pub type HypervisorResult<T> = Result<T, HypervisorError>;
-
-/// Interface for the component to execute internal queries triggered by IC.
-pub type AnonymousQueryService =
-    BoxCloneService<AnonymousQuery, AnonymousQueryResponse, Infallible>;
 
 /// Interface for the component to filter out ingress messages that
 /// the canister is not willing to accept.
@@ -422,38 +467,23 @@ pub type IngressFilterService = BoxCloneService<
 >;
 
 /// Errors that can occur when handling a query execution request.
+#[derive(Debug, Error)]
 pub enum QueryExecutionError {
+    #[error("Certified state is not available yet")]
     CertifiedStateUnavailable,
 }
 
 /// The response type to a `call()` request in [`QueryExecutionService`].
 /// An Ok response contains the response from the canister and the batch time at the time of execution.
-pub type QueryExecutionResponse = Result<(HttpQueryResponse, Time), QueryExecutionError>;
+pub type QueryExecutionResponse =
+    Result<(Result<WasmResult, UserError>, Time), QueryExecutionError>;
 
 /// Interface for the component to execute queries.
 pub type QueryExecutionService =
-    BoxCloneService<(UserQuery, Option<CertificateDelegation>), QueryExecutionResponse, Infallible>;
-
-/// Interface for the component to execute queries on canisters.  It can be used
-/// by the HttpHandler and other system components to execute queries.
-pub trait QueryHandler: Send + Sync {
-    /// Type of state managed by StateReader.
-    ///
-    /// Should typically be `ic_replicated_state::ReplicatedState`.
-    // Note [Associated Types in Interfaces]
-    type State;
-
-    /// Handle a query of type `UserQuery` which was sent by an end user.
-    fn query(
-        &self,
-        query: UserQuery,
-        state: Labeled<Arc<Self::State>>,
-        data_certificate: Vec<u8>,
-    ) -> Result<WasmResult, UserError>;
-}
+    BoxCloneService<(Query, Option<CertificateDelegation>), QueryExecutionResponse, Infallible>;
 
 /// Errors that can be returned when reading/writing from/to ingress history.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Eq, PartialEq, Debug)]
 pub enum IngressHistoryError {
     StateRemoved(Height),
     StateNotAvailableYet(Height),
@@ -484,13 +514,18 @@ pub trait IngressHistoryWriter: Send + Sync {
     // Note [Associated Types in Interfaces]
     type State;
 
-    /// Allows to set status on a message.
+    /// Sets the status of a message. Returns the message's previous status.
     ///
     /// The allowed status transitions are:
     /// * "None" -> {"Received", "Processing", "Completed", "Failed"}
     /// * "Received" -> {"Processing", "Completed", "Failed"}
     /// * "Processing" -> {"Processing", "Completed", "Failed"}
-    fn set_status(&self, state: &mut Self::State, message_id: MessageId, status: IngressStatus);
+    fn set_status(
+        &self,
+        state: &mut Self::State,
+        message_id: MessageId,
+        status: IngressStatus,
+    ) -> Arc<IngressStatus>;
 }
 
 /// A trait for handling `out_of_instructions()` calls from the Wasm module.
@@ -501,6 +536,10 @@ pub trait OutOfInstructionsHandler {
     // the function returns `Err(HypervisorError::InstructionLimitExceeded)`.
     // Otherwise, the function returns a new positive instruction counter.
     fn out_of_instructions(&self, instruction_counter: i64) -> HypervisorResult<i64>;
+
+    // Invoked only when a long execution dirties many memory pages to yield control
+    // and start the copy only in a new slice. This is a performance improvement.
+    fn yield_for_dirty_memory_copy(&self, instruction_counter: i64) -> HypervisorResult<i64>;
 }
 
 /// Indicates the type of stable memory API being used.
@@ -582,39 +621,39 @@ pub trait SystemApi {
     /// id in case of requests or the user id in case of an ingress message.
     fn ic0_msg_caller_copy(
         &self,
-        dst: u32,
-        offset: u32,
-        size: u32,
+        dst: usize,
+        offset: usize,
+        size: usize,
         heap: &mut [u8],
     ) -> HypervisorResult<()>;
 
     /// Returns the size of the opaque caller blob.
-    fn ic0_msg_caller_size(&self) -> HypervisorResult<u32>;
+    fn ic0_msg_caller_size(&self) -> HypervisorResult<usize>;
 
     /// Returns the size of msg.payload.
-    fn ic0_msg_arg_data_size(&self) -> HypervisorResult<u32>;
+    fn ic0_msg_arg_data_size(&self) -> HypervisorResult<usize>;
 
     /// Copies `length` bytes from msg.payload[offset..offset+size] to
     /// memory[dst..dst+size].
     fn ic0_msg_arg_data_copy(
         &self,
-        dst: u32,
-        offset: u32,
-        size: u32,
+        dst: usize,
+        offset: usize,
+        size: usize,
         heap: &mut [u8],
     ) -> HypervisorResult<()>;
 
     /// Used to look up the size of the method_name that the message wants to
     /// call. Can only be called in the context of inspecting messages.
-    fn ic0_msg_method_name_size(&self) -> HypervisorResult<u32>;
+    fn ic0_msg_method_name_size(&self) -> HypervisorResult<usize>;
 
     /// Used to copy the method_name that the message wants to call to heap. Can
     /// only be called in the context of inspecting messages.
     fn ic0_msg_method_name_copy(
         &self,
-        dst: u32,
-        offset: u32,
-        size: u32,
+        dst: usize,
+        offset: usize,
+        size: usize,
         heap: &mut [u8],
     ) -> HypervisorResult<()>;
 
@@ -627,8 +666,8 @@ pub trait SystemApi {
     /// it to the (initially empty) data reply.
     fn ic0_msg_reply_data_append(
         &mut self,
-        src: u32,
-        size: u32,
+        src: usize,
+        size: usize,
         heap: &[u8],
     ) -> HypervisorResult<()>;
 
@@ -644,14 +683,14 @@ pub trait SystemApi {
     fn ic0_msg_reject_code(&self) -> HypervisorResult<i32>;
 
     /// Replies to sender with an error message
-    fn ic0_msg_reject(&mut self, src: u32, size: u32, heap: &[u8]) -> HypervisorResult<()>;
+    fn ic0_msg_reject(&mut self, src: usize, size: usize, heap: &[u8]) -> HypervisorResult<()>;
 
     /// Returns the length of the reject message in bytes.
     ///
     /// # Panics
     ///
     /// This traps if not invoked from a reject callback.
-    fn ic0_msg_reject_msg_size(&self) -> HypervisorResult<u32>;
+    fn ic0_msg_reject_msg_size(&self) -> HypervisorResult<usize>;
 
     /// Copies length bytes from self.reject_msg[offset..offset+size] to
     /// memory[dst..dst+size]
@@ -663,9 +702,9 @@ pub trait SystemApi {
     /// called from inside a reject callback.
     fn ic0_msg_reject_msg_copy(
         &self,
-        dst: u32,
-        offset: u32,
-        size: u32,
+        dst: usize,
+        offset: usize,
+        size: usize,
         heap: &mut [u8],
     ) -> HypervisorResult<()>;
 
@@ -676,17 +715,17 @@ pub trait SystemApi {
     /// canister to heap[dst..dst+size].
     fn ic0_canister_self_copy(
         &mut self,
-        dst: u32,
-        offset: u32,
-        size: u32,
+        dst: usize,
+        offset: usize,
+        size: usize,
         heap: &mut [u8],
     ) -> HypervisorResult<()>;
 
     /// Outputs the specified bytes on the heap as a string on STDOUT.
-    fn ic0_debug_print(&self, src: u32, size: u32, heap: &[u8]) -> HypervisorResult<()>;
+    fn ic0_debug_print(&self, src: usize, size: usize, heap: &[u8]) -> HypervisorResult<()>;
 
     /// Traps, with a possibly helpful message
-    fn ic0_trap(&self, src: u32, size: u32, heap: &[u8]) -> HypervisorResult<()>;
+    fn ic0_trap(&self, src: usize, size: usize, heap: &[u8]) -> HypervisorResult<()>;
 
     /// Begins assembling a call to the canister specified by
     /// callee_src/callee_size at method name_src/name_size. Two mandatory
@@ -700,28 +739,51 @@ pub trait SystemApi {
     #[allow(clippy::too_many_arguments)]
     fn ic0_call_new(
         &mut self,
-        callee_src: u32,
-        callee_size: u32,
-        name_src: u32,
-        name_len: u32,
+        callee_src: usize,
+        callee_size: usize,
+        name_src: usize,
+        name_len: usize,
         reply_fun: u32,
-        reply_env: u32,
+        reply_env: u64,
         reject_fun: u32,
-        reject_env: u32,
+        reject_env: u64,
         heap: &[u8],
     ) -> HypervisorResult<()>;
 
     /// Appends the specified bytes to the argument of the call. Initially, the
     /// argument is empty. This can be called multiple times between
     /// `ic0.call_new` and `ic0.call_perform`.
-    fn ic0_call_data_append(&mut self, src: u32, size: u32, heap: &[u8]) -> HypervisorResult<()>;
+    fn ic0_call_data_append(
+        &mut self,
+        src: usize,
+        size: usize,
+        heap: &[u8],
+    ) -> HypervisorResult<()>;
+
+    /// Relaxes the response delivery guarantee to be best effort, asking the system to respond at the
+    /// latest after `timeout_seconds` have elapsed. Best effort means the system may also respond with
+    /// a `SYS_UNKNOWN` reject code, signifying that the call may or may not have been processed by
+    /// the callee. Then, even if the callee produces a response, it will not be delivered to the caller.
+    /// Any value for `timeout_seconds` is permitted, but is silently bounded by the `MAX_CALL_TIMEOUT`
+    /// system constant; i.e., larger timeouts are treated as equivalent to `MAX_CALL_TIMEOUT` and do not
+    /// cause an error.
+    ///
+    /// This method can be called only in between `ic0.call_new` and `ic0.call_perform`, and at most once at that.
+    /// Otherwise, it traps. A different timeout can be specified for each call.
+    fn ic0_call_with_best_effort_response(&mut self, timeout_seconds: u32) -> HypervisorResult<()>;
+
+    /// The deadline, in nanoseconds since 1970-01-01, after which the caller might stop waiting for a response.
+    ///
+    /// For calls with best-effort responses, the deadline is computed based on the time the call was made, and
+    /// the `timeout_seconds` parameter provided by the caller. For other calls, a deadline of 0 will be returned.
+    fn ic0_msg_deadline(&self) -> HypervisorResult<u64>;
 
     /// Specifies the closure to be called if the reply/reject closures trap.
     /// Can be called at most once between `ic0.call_new` and
     /// `ic0.call_perform`.
     ///
-    /// See <https://sdk.dfinity.org/docs/interface-spec/index.html#system-api-call>
-    fn ic0_call_on_cleanup(&mut self, fun: u32, env: u32) -> HypervisorResult<()>;
+    /// See <https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api-call>
+    fn ic0_call_on_cleanup(&mut self, fun: u32, env: u64) -> HypervisorResult<()>;
 
     /// (deprecated) Please use `ic0_call_cycles_add128` instead, as this API
     /// can only add a 64-bit value.
@@ -858,7 +920,7 @@ pub trait SystemApi {
         &self,
         offset: u64,
         size: u64,
-    ) -> HypervisorResult<(NumPages, NumInstructions)>;
+    ) -> HypervisorResult<(NumOsPages, NumInstructions)>;
 
     /// The canister can query the IC for the current time.
     fn ic0_time(&mut self) -> HypervisorResult<Time>;
@@ -898,14 +960,18 @@ pub trait SystemApi {
     /// Otherwise, the function return a new non-negative instruction counter.
     fn out_of_instructions(&mut self, instruction_counter: i64) -> HypervisorResult<i64>;
 
+    /// This system call is not part of the public spec and it is invoked when
+    /// Wasm execution has a large number of dirty pages that, for performance reasons,
+    /// should be copied in a new execution slice.
+    fn yield_for_dirty_memory_copy(&mut self, instruction_counter: i64) -> HypervisorResult<i64>;
+
     /// This system call is not part of the public spec. It's called after a
-    /// native `memory.grow` or `table.grow` has been called to check whether
-    /// there's enough available memory left.
-    fn update_available_memory(
+    /// native `memory.grow` has been executed to check whether there's enough
+    /// available memory left.
+    fn try_grow_wasm_memory(
         &mut self,
         native_memory_grow_res: i64,
-        additional_elements: u64,
-        element_size: u64,
+        additional_wasm_pages: u64,
     ) -> HypervisorResult<()>;
 
     /// Attempts to allocate memory before calling stable grow. Will also check
@@ -935,7 +1001,11 @@ pub trait SystemApi {
     /// The amount of cycles is represented by a 128-bit value
     /// and is copied in the canister memory starting
     /// starting at the location `dst`.
-    fn ic0_canister_cycle_balance128(&mut self, dst: u32, heap: &mut [u8]) -> HypervisorResult<()>;
+    fn ic0_canister_cycle_balance128(
+        &mut self,
+        dst: usize,
+        heap: &mut [u8],
+    ) -> HypervisorResult<()>;
 
     /// (deprecated) Please use `ic0_msg_cycles_available128` instead.
     /// This API supports only 64-bit values.
@@ -951,7 +1021,7 @@ pub trait SystemApi {
     /// The amount of cycles is represented by a 128-bit value
     /// and is copied in the canister memory starting
     /// starting at the location `dst`.
-    fn ic0_msg_cycles_available128(&self, dst: u32, heap: &mut [u8]) -> HypervisorResult<()>;
+    fn ic0_msg_cycles_available128(&self, dst: usize, heap: &mut [u8]) -> HypervisorResult<()>;
 
     /// (deprecated) Please use `ic0_msg_cycles_refunded128` instead.
     /// This API supports only 64-bit values.
@@ -967,7 +1037,7 @@ pub trait SystemApi {
     /// The amount of cycles is represented by a 128-bit value
     /// and is copied in the canister memory starting
     /// starting at the location `dst`.
-    fn ic0_msg_cycles_refunded128(&self, dst: u32, heap: &mut [u8]) -> HypervisorResult<()>;
+    fn ic0_msg_cycles_refunded128(&self, dst: usize, heap: &mut [u8]) -> HypervisorResult<()>;
 
     /// (deprecated) Please use `ic0_msg_cycles_accept128` instead.
     /// This API supports only 64-bit values.
@@ -1013,13 +1083,18 @@ pub trait SystemApi {
     fn ic0_msg_cycles_accept128(
         &mut self,
         max_amount: Cycles,
-        dst: u32,
+        dst: usize,
         heap: &mut [u8],
     ) -> HypervisorResult<()>;
 
     /// Sets the certified data for the canister.
-    /// See: <https://sdk.dfinity.org/docs/interface-spec/index.html#system-api-certified-data>
-    fn ic0_certified_data_set(&mut self, src: u32, size: u32, heap: &[u8]) -> HypervisorResult<()>;
+    /// See: <https://internetcomputer.org/docs/current/references/ic-interface-spec#system-api-certified-data>
+    fn ic0_certified_data_set(
+        &mut self,
+        src: usize,
+        size: usize,
+        heap: &[u8],
+    ) -> HypervisorResult<()>;
 
     /// If run in non-replicated execution (i.e. query),
     /// returns 1 if the data certificate is present, 0 otherwise.
@@ -1030,16 +1105,16 @@ pub trait SystemApi {
     /// Returns the size of the data certificate if it is present
     /// (i.e. data_certificate_present returns 1).
     /// Traps if data_certificate_present returns 0.
-    fn ic0_data_certificate_size(&self) -> HypervisorResult<i32>;
+    fn ic0_data_certificate_size(&self) -> HypervisorResult<usize>;
 
     /// Copies the data certificate into the heap if it is present
     /// (i.e. data_certificate_present returns 1).
     /// Traps if data_certificate_present returns 0.
     fn ic0_data_certificate_copy(
-        &self,
-        dst: u32,
-        offset: u32,
-        size: u32,
+        &mut self,
+        dst: usize,
+        offset: usize,
+        size: usize,
         heap: &mut [u8],
     ) -> HypervisorResult<()>;
 
@@ -1052,19 +1127,31 @@ pub trait SystemApi {
     ///
     /// Adds no more cycles than `amount`.
     ///
-    /// The canister balance afterwards does not exceed
-    /// maximum amount of cycles it can hold.
-    /// However, canisters on system subnets have no balance limit.
-    ///
     /// Returns the amount of cycles added to the canister's balance.
     fn ic0_mint_cycles(&mut self, amount: u64) -> HypervisorResult<u64>;
+
+    /// Mints the `amount` cycles
+    /// Adds cycles to the canister's balance.
+    ///
+    /// Adds no more cycles than `amount`. The balance afterwards cannot
+    /// exceed u128::MAX, so the amount added may be less than `amount`.
+    ///
+    /// The amount of cycles added to the canister's balance is
+    /// represented by a 128-bit value and is copied in the canister
+    /// memory starting at the location `dst`.
+    fn ic0_mint_cycles128(
+        &mut self,
+        amount: Cycles,
+        dst: usize,
+        heap: &mut [u8],
+    ) -> HypervisorResult<()>;
 
     /// Checks whether the principal identified by src/size is one of the
     /// controllers of the canister. If yes, then a value of 1 is returned,
     /// otherwise a 0 is returned. It can be called multiple times.
     ///
     /// This system call traps if src+size exceeds the size of the WebAssembly memory.
-    fn ic0_is_controller(&self, src: u32, size: u32, heap: &[u8]) -> HypervisorResult<u32>;
+    fn ic0_is_controller(&self, src: usize, size: usize, heap: &[u8]) -> HypervisorResult<u32>;
 
     /// If run in replicated execution (i.e. an update call or a certified
     /// query), returns 1.
@@ -1082,12 +1169,12 @@ pub trait SystemApi {
     fn ic0_cycles_burn128(
         &mut self,
         amount: Cycles,
-        dst: u32,
+        dst: usize,
         heap: &mut [u8],
     ) -> HypervisorResult<()>;
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
 
 /// Indicate whether a checkpoint will be taken after the current round or not.
 pub enum ExecutionRoundType {
@@ -1095,13 +1182,36 @@ pub enum ExecutionRoundType {
     OrdinaryRound,
 }
 
+/// Execution round properties collected form the last DKG summary block.
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub struct ExecutionRoundSummary {
+    /// The next checkpoint round height.
+    ///
+    /// In a case of a subnet recovery, the DSM will observe an instant
+    /// jump for the `batch_number` and `next_checkpoint_height` values.
+    /// The `next_checkpoint_height`, if set, should be always greater
+    /// than the `batch_number`.
+    pub next_checkpoint_round: ExecutionRound,
+    /// The current checkpoint interval length.
+    ///
+    /// The DKG interval length is normally 499 rounds (199 for system subnets).
+    pub current_interval_length: ExecutionRound,
+}
+
 /// Configuration of execution that comes from the registry.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Eq, PartialEq, Debug)]
 pub struct RegistryExecutionSettings {
     pub max_number_of_canisters: u64,
     pub provisional_whitelist: ProvisionalWhitelist,
-    pub max_ecdsa_queue_size: u32,
+    pub chain_key_settings: BTreeMap<MasterPublicKeyId, ChainKeySettings>,
     pub subnet_size: usize,
+}
+
+/// Chain key configuration of execution that comes from the registry.
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub struct ChainKeySettings {
+    pub max_queue_size: u32,
+    pub pre_signatures_to_create_in_advance: u32,
 }
 
 pub trait Scheduler: Send {
@@ -1121,7 +1231,7 @@ pub trait Scheduler: Send {
     ///   use during an execution round.
     /// * `max_instructions_per_round`: max number of instructions a single
     ///   round on a single thread can
-    /// consume.
+    ///   consume.
     /// * `max_instructions_per_message`: max number of instructions a single
     ///   message execution can consume.
     ///
@@ -1158,28 +1268,17 @@ pub trait Scheduler: Send {
         &self,
         state: Self::State,
         randomness: Randomness,
-        ecdsa_subnet_public_keys: BTreeMap<EcdsaKeyId, MasterEcdsaPublicKey>,
+        chain_key_subnet_public_keys: BTreeMap<MasterPublicKeyId, MasterPublicKey>,
+        idkg_pre_signature_ids: BTreeMap<MasterPublicKeyId, BTreeSet<PreSigId>>,
+        replica_version: &ReplicaVersion,
         current_round: ExecutionRound,
+        round_summary: Option<ExecutionRoundSummary>,
         current_round_type: ExecutionRoundType,
         registry_settings: &RegistryExecutionSettings,
     ) -> Self::State;
 }
 
-/// Synchronous interface for use in testing
-/// to filter out ingress messages that
-/// the canister is not willing to accept.
-pub trait IngressFilter: Send + Sync {
-    type State;
-
-    fn should_accept_ingress_message(
-        &self,
-        state: Arc<Self::State>,
-        provisional_whitelist: &ProvisionalWhitelist,
-        ingress: &SignedIngressContent,
-    ) -> Result<(), UserError>;
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, PartialEq, Debug, Deserialize, Serialize)]
 pub struct WasmExecutionOutput {
     pub wasm_result: Result<Option<WasmResult>, HypervisorError>,
     pub num_instructions_left: NumInstructions,
@@ -1188,6 +1287,7 @@ pub struct WasmExecutionOutput {
     pub instance_stats: InstanceStats,
     /// How many times each tracked System API call was invoked.
     pub system_api_call_counters: SystemApiCallCounters,
+    pub canister_log: CanisterLog,
 }
 
 impl fmt::Display for WasmExecutionOutput {
@@ -1202,8 +1302,8 @@ impl fmt::Display for WasmExecutionOutput {
         write!(f, "wasm_result => [{}], instructions left => {}, instance_stats => [ accessed pages => {}, dirty pages => {}]",
                wasm_result_str,
                self.num_instructions_left,
-               self.instance_stats.accessed_pages,
-               self.instance_stats.dirty_pages,
+               self.instance_stats.wasm_accessed_pages + self.instance_stats.stable_accessed_pages,
+               self.instance_stats.wasm_dirty_pages + self.instance_stats.stable_dirty_pages,
         )
     }
 }

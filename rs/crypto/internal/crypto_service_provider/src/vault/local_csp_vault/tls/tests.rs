@@ -1,11 +1,9 @@
-#![allow(clippy::unwrap_used)]
-
 use crate::vault::local_csp_vault::tls::SecretKeyStoreInsertionError;
 use crate::vault::test_utils::sks::secret_key_store_containing_key_with_invalid_encoding;
 use crate::vault::test_utils::sks::secret_key_store_with_duplicated_key_id_error_on_insert;
 use crate::LocalCspVault;
 use assert_matches::assert_matches;
-use ic_test_utilities::FastForwardTimeSource;
+use ic_test_utilities_time::FastForwardTimeSource;
 use ic_types_test_utils::ids::node_test_id;
 
 const NODE_1: u64 = 4241;
@@ -23,6 +21,7 @@ mod keygen {
     use crate::vault::local_csp_vault::tls::RFC5280_NO_WELL_DEFINED_CERTIFICATE_EXPIRATION_DATE;
     use crate::vault::local_csp_vault::LocalCspVault;
     use ic_crypto_tls_interfaces::TlsPublicKeyCert;
+    use ic_interfaces::time_source::TimeSource;
     use mockall::Sequence;
     use proptest::proptest;
     use rand::SeedableRng;
@@ -75,15 +74,24 @@ mod keygen {
     }
 
     #[test]
-    fn should_return_der_encoded_self_signed_certificate() {
-        let csp_vault = LocalCspVault::builder_for_test().build();
+    fn should_create_cert_that_passes_node_key_validation() {
+        let node_id = node_test_id(NODE_1);
+        let time_source = FastForwardTimeSource::new();
+        let csp_vault = LocalCspVault::builder_for_test()
+            .with_time_source(Arc::clone(&time_source) as _)
+            .build();
         let cert = csp_vault
-            .gen_tls_key_pair(node_test_id(NODE_1))
+            .gen_tls_key_pair(node_id)
             .expect("Generation of TLS keys failed.");
 
-        let x509_cert = &x509(&cert);
-        assert_eq!(x509_cert.verify_signature(None), Ok(()));
-        assert_eq!(x509_cert.subject(), x509_cert.issuer());
+        assert_matches!(
+            ic_crypto_node_key_validation::ValidTlsCertificate::try_from((
+                cert.to_proto(),
+                node_id,
+                time_source.get_relative_time(),
+            )),
+            Ok(_)
+        );
     }
 
     #[test]
@@ -164,7 +172,6 @@ mod keygen {
     #[test]
     fn should_set_cert_not_before_correctly() {
         use ic_crypto_test_utils_reproducible_rng::reproducible_rng;
-        use ic_interfaces::time_source::TimeSource;
         use ic_types::time::Time;
 
         const NANOS_PER_SEC: u64 = 1_000_000_000;
