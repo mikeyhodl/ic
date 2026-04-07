@@ -2383,7 +2383,6 @@ impl ExecutionEnvironment {
         msg: &mut CanisterCall,
         state: &mut ReplicatedState,
     ) -> ExecuteSubnetMessageResult {
-        let cost_schedule = state.get_own_cost_schedule();
         match state.canister_state_make_mut(&canister_id) {
             None => {
                 let err = UserError::new(
@@ -2399,12 +2398,9 @@ impl ExecutionEnvironment {
             Some(canister_state) => {
                 let cycles = msg.take_cycles();
                 let sender = *msg.sender();
-                let response = self.canister_manager.deposit_cycles(
-                    canister_state,
-                    cycles,
-                    sender,
-                    cost_schedule,
-                );
+                let response = self
+                    .canister_manager
+                    .deposit_cycles(canister_state, cycles, sender);
                 self.process_canister_manager_response(response, state, msg)
             }
         }
@@ -2512,16 +2508,9 @@ impl ExecutionEnvironment {
         state: &mut ReplicatedState,
         provisional_whitelist: &ProvisionalWhitelist,
     ) -> Result<Vec<u8>, UserError> {
-        let cost_schedule = state.get_own_cost_schedule();
         let canister = canister_make_mut(canister_id, state)?;
         self.canister_manager
-            .add_cycles(
-                sender,
-                cycles,
-                canister,
-                provisional_whitelist,
-                cost_schedule,
-            )
+            .add_cycles(sender, cycles, canister, provisional_whitelist)
             .map(|()| EmptyBlob.encode())
             .map_err(|err| err.into())
     }

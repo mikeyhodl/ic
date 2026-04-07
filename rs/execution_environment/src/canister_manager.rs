@@ -60,7 +60,7 @@ use ic_types::{
 };
 use ic_types_cycles::{
     CanisterCreation, CanisterCyclesCostSchedule, CompoundCycles, Cycles, CyclesUseCase,
-    Instructions, NonConsumed,
+    Instructions,
 };
 use ic_wasm_types::WasmHash;
 use more_asserts::{debug_assert_ge, debug_assert_le};
@@ -1480,7 +1480,7 @@ impl CanisterManager {
             Arc::clone(&self.fd_factory),
         );
 
-        system_state.remove_cycles(creation_fee);
+        system_state.consume_cycles(creation_fee);
         let mut new_canister = CanisterState::new(
             system_state,
             None,
@@ -1558,7 +1558,6 @@ impl CanisterManager {
         cycles_amount: Option<u128>,
         canister: &mut CanisterState,
         provisional_whitelist: &ProvisionalWhitelist,
-        cost_schedule: CanisterCyclesCostSchedule,
     ) -> Result<(), CanisterManagerError> {
         if !provisional_whitelist.contains(&sender) {
             return Err(CanisterManagerError::SenderNotInWhitelist(sender));
@@ -1569,12 +1568,7 @@ impl CanisterManager {
             None => self.config.default_provisional_cycles_balance,
         };
 
-        canister
-            .system_state
-            .add_cycles(CompoundCycles::<NonConsumed>::new(
-                cycles_amount,
-                cost_schedule,
-            ));
+        canister.system_state.add_cycles(cycles_amount);
 
         Ok(())
     }
@@ -1584,13 +1578,10 @@ impl CanisterManager {
         canister: &mut CanisterState,
         cycles: Cycles,
         sender: PrincipalId,
-        cost_schedule: CanisterCyclesCostSchedule,
     ) -> CanisterManagerResponse {
         let canister_id = canister.canister_id();
 
-        canister
-            .system_state
-            .add_cycles(CompoundCycles::<NonConsumed>::new(cycles, cost_schedule));
+        canister.system_state.add_cycles(cycles);
 
         if cycles.get() > LOG_CANISTER_OPERATION_CYCLES_THRESHOLD {
             info!(
